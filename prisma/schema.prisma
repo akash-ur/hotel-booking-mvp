@@ -1,0 +1,30 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BookingStatus {
+  PENDING // awaiting payment (kept for future phase, unused for now — MVP marks bookings CONFIRMED directly since no payment yet)
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+}
+
+model HotelBooking {
+  id        String        @id @default(cuid())
+  userId    String // dummy/hardcoded for now — real auth (Clerk) comes later
+  hotelId   String
+  roomId    String
+  checkIn   DateTime
+  checkOut  DateTime
+  guests    Int           @default(1)
+  status    BookingStatus @default(CONFIRMED) // MVP: no payment step, so booking is confirmed immediately
+  createdAt DateTime      @default(now())
+
+  @@index([userId])
+  @@index([hotelId, checkIn, checkOut])
+}
