@@ -9,69 +9,79 @@ import { getRoomById } from "@/data/rooms";
 /**
  * POST /api/bookings
  * Body: { hotelId, roomId, checkIn, checkOut, guests }
- * (BE-6: Booking Creation Endpoint — MVP version, NO PAYMENT)
  *
- * MVP behaviour differs from the full doc spec (BE-6) on purpose:
- * - No Payments module hand-off yet — booking is created straight to
- *   CONFIRMED status instead of "awaiting payment".
- * - Still re-checks availability server-side before creating the record
- *   (never trusts the earlier /api/availability call).
- * - Still supports a basic idempotency key so a dropped-connection retry
- *   doesn't create a duplicate booking.
+ * BE-6: Booking Creation Endpoint — MVP version, NO PAYMENT
  *
- * When the Payments module is ready: change `status: "CONFIRMED"` below
- * to `"PENDING"`, call the Payments contract, and let the webhook flip
- * it to CONFIRMED — the rest of this route stays the same.
+ * MVP behaviour:
+ * - No Payments module yet — booking is created directly as CONFIRMED.
+ * - Re-checks availability server-side before creating the booking.
+ * - Prevents overlapping bookings for the same room.
  */
 export async function POST(request: NextRequest) {
   try {
-    // Requires an authenticated user (BE-6). Real auth isn't wired up yet,
-    // so this always resolves to a dummy demo user — see lib/auth.ts.
+    // -----------------------------------------------------------------------
+    // Authentication
+    // -----------------------------------------------------------------------
     const userId = getCurrentUserId();
+
     if (!userId) {
       return NextResponse.json(
-        { success: false, error: "You must be logged in to book" },
+        {
+          success: false,
+          error: "You must be logged in to book",
+        },
         { status: 401 }
       );
     }
 
+    // -----------------------------------------------------------------------
+    // Validate request body
+    // -----------------------------------------------------------------------
     const body = await request.json();
+
     const parsed = createBookingSchema.safeParse(body);
 
     if (!parsed.success) {
       return NextResponse.json(
-        { success: false, error: "Invalid booking data", issues: parsed.error.flatten() },
+        {
+          success: false,
+          error: "Invalid booking data",
+          issues: parsed.error.flatten(),
+        },
         { status: 400 }
       );
     }
 
     const { hotelId, roomId, checkIn, checkOut, guests } = parsed.data;
 
-    // --- Idempotency guard -------------------------------------------------
-    // Client sends the same key on retry (e.g. after a dropped connection).
-    // If a booking with this exact key already exists, return it instead
-    // of creating a duplicate. For MVP we derive a natural key from the
-    // request itself since there's no payment session id yet.
-    const idempotencyKey = request.headers.get("x-idempotency-key");
-    if (idempotencyKey) {
-      const existing = await prisma.hotelBooking.findFirst({
-        where: {
-          userId,
-          hotelId,
-          roomId,
-          checkIn,
-          checkOut,
+    // -----------------------------------------------------------------------
+    // Validate room capacity
+    // -----------------------------------------------------------------------
+    const room = getRoomById(roomId);
+
+    if (!room) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Room not found",
         },
-      });
-      if (existing) {
-        return NextResponse.json(
-          { success: true, data: enrichBooking(existing) },
-          { status: 200 }
-        );
-      }
+        { status: 404 }
+      );
     }
 
-    // --- Re-check availability server-side (do NOT trust the FE-4 check) --
+    if (guests > room.maxGuests) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: `This room fits up to ${room.maxGuests} guests`,
+        },
+        { status: 400 }
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Re-check availability using hotel adapter
+    // -----------------------------------------------------------------------
     const availability = await hotelAdapter.checkAvailability({
       hotelId,
       roomId,
@@ -83,21 +93,53 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         {
           success: false,
-          error: availability.reason ?? "Room is no longer available for these dates",
+          error:
+            availability.reason ??
+            "Room is no longer available for these dates",
         },
-        { status: 409 } // Conflict — most accurate status for "no longer available"
+        { status: 409 }
       );
     }
 
-    const room = getRoomById(roomId);
-    if (room && guests > room.maxGuests) {
+    // -----------------------------------------------------------------------
+    // Check existing bookings for overlapping dates
+    //
+    // Existing booking:
+    //   checkIn  < requested checkOut
+    //   checkOut > requested checkIn
+    //
+    // This blocks:
+    //   10-11 vs 10-11
+    //   10-11 vs 10-12
+    //   10-11 vs 11-12  -> allowed (back-to-back)
+    //   10-11 vs 09-10  -> allowed (back-to-back)
+    // -----------------------------------------------------------------------
+    const overlappingBooking = await prisma.hotelBooking.findFirst({
+      where: {
+        roomId,
+        status: "CONFIRMED",
+        checkIn: {
+          lt: checkOut,
+        },
+        checkOut: {
+          gt: checkIn,
+        },
+      },
+    });
+
+    if (overlappingBooking) {
       return NextResponse.json(
-        { success: false, error: `This room fits up to ${room.maxGuests} guests` },
-        { status: 400 }
+        {
+          success: false,
+          error: "Room is already booked for the selected dates",
+        },
+        { status: 409 }
       );
     }
 
-    // --- Create the booking -------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Create booking
+    // -----------------------------------------------------------------------
     const booking = await prisma.hotelBooking.create({
       data: {
         userId,
@@ -106,21 +148,25 @@ export async function POST(request: NextRequest) {
         checkIn,
         checkOut,
         guests,
-        status: "CONFIRMED", // MVP: no payment step yet — see note above
+        status: "CONFIRMED",
       },
     });
 
-    // BE-7 note: in the real flow, this is where a `booking.confirmed`
-    // event would fire for the Notifications module. Skipped for MVP.
-
     return NextResponse.json(
-      { success: true, data: enrichBooking(booking) },
+      {
+        success: true,
+        data: enrichBooking(booking),
+      },
       { status: 201 }
     );
   } catch (error) {
     console.error("Booking creation failed:", error);
+
     return NextResponse.json(
-      { success: false, error: "Failed to create booking. Please try again." },
+      {
+        success: false,
+        error: "Failed to create booking. Please try again.",
+      },
       { status: 500 }
     );
   }
@@ -128,32 +174,45 @@ export async function POST(request: NextRequest) {
 
 /**
  * GET /api/bookings
- * (BE-8: list the authenticated user's bookings)
+ *
+ * BE-8: List authenticated user's bookings
  */
 export async function GET() {
   try {
     const userId = getCurrentUserId();
 
     const bookings = await prisma.hotelBooking.findMany({
-      where: { userId },
-      orderBy: { createdAt: "desc" },
+      where: {
+        userId,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
     });
 
     return NextResponse.json(
-      { success: true, data: bookings.map(enrichBooking) },
+      {
+        success: true,
+        data: bookings.map(enrichBooking),
+      },
       { status: 200 }
     );
   } catch (error) {
     console.error("Fetching bookings failed:", error);
+
     return NextResponse.json(
-      { success: false, error: "Failed to load bookings" },
+      {
+        success: false,
+        error: "Failed to load bookings",
+      },
       { status: 500 }
     );
   }
 }
 
-// Attaches display-friendly hotel/room names + total price to a raw
-// booking row, since the DB only stores IDs (per BE-9).
+// -----------------------------------------------------------------------------
+// Enrich booking with hotel/room display information
+// -----------------------------------------------------------------------------
 function enrichBooking(booking: {
   id: string;
   userId: string;
@@ -171,10 +230,14 @@ function enrichBooking(booking: {
   const nights = Math.max(
     1,
     Math.round(
-      (booking.checkOut.getTime() - booking.checkIn.getTime()) / (1000 * 60 * 60 * 24)
+      (booking.checkOut.getTime() - booking.checkIn.getTime()) /
+        (1000 * 60 * 60 * 24)
     )
   );
-  const totalPrice = room ? room.pricePerNight * nights : undefined;
+
+  const totalPrice = room
+    ? room.pricePerNight * nights
+    : undefined;
 
   return {
     ...booking,
