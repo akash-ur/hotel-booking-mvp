@@ -122,7 +122,7 @@ export default function BookingPanel({
         </Button>
 
         <p className="text-xs text-gray-400 text-center">
-          No payment required in this demo — booking confirms instantly.
+        No payment required. Booking will be confirmed instantly.
         </p>
       </CardContent>
     </Card>

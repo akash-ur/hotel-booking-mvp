@@ -81,7 +81,7 @@ export default function Footer() {
       </div>
 
       <div className="border-t border-white/10 py-6 text-center text-xs text-gray-500">
-        © {new Date().getFullYear()} Luxe Stays. All rights reserved. (MVP demo)
+        © {new Date().getFullYear()} Luxe Stays. All rights reserved.
       </div>
     </footer>
   );
